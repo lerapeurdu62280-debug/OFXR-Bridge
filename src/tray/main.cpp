@@ -57,6 +57,15 @@ enum MenuCommand : UINT {
     exit_application = 150,
 };
 
+// The always-visible main window's child controls are created with the
+// exact same command IDs as the MenuCommand values above (toggle_arm,
+// backend_fidelity_fx, ...). WM_COMMAND from either the window or the tray
+// context menu therefore lands in the same handle_command() switch with no
+// translation table in between, so the two surfaces cannot drift apart.
+// status_label/about/open_logs reuse existing MenuCommand IDs (show_about,
+// open_logs) directly; only the label needs a distinct, non-command ID.
+constexpr int kStatusLabelControlId = 199;
+
 struct AppState {
     HWND window{};
     NOTIFYICONDATAW icon{};
@@ -74,6 +83,26 @@ struct AppState {
     HICON disarmed_icon{};
     UINT taskbar_created_message{};
     bool armed{};
+
+    // Always-visible main window controls, populated once at creation and
+    // refreshed by refresh_main_window() after any setting change. Empty
+    // (all nullptr) until the window has been laid out.
+    HWND main_arm_button{};
+    HWND main_status_label{};
+    HWND main_backend_fidelity_fx{};
+    HWND main_backend_nvidia_fast{};
+    HWND main_backend_nvidia_medium{};
+    HWND main_backend_nvidia_slow{};
+    HWND main_nvidia_bidirectional{};
+    HWND main_nvidia_scale_full{};
+    HWND main_nvidia_scale_three_quarter{};
+    HWND main_nvidia_scale_half{};
+    HWND main_diagnostics{};
+    HWND main_overlay_off{};
+    HWND main_overlay_upper_left{};
+    HWND main_overlay_upper_right{};
+    HWND main_overlay_lower_left{};
+    HWND main_overlay_lower_right{};
 };
 
 [[nodiscard]] std::wstring last_error_message(std::wstring_view action) {
@@ -410,6 +439,214 @@ void show_balloon(
     return Shell_NotifyIconW(NIM_ADD, &state.icon) != FALSE;
 }
 
+// Mirrors the checked/label state of the always-visible main window onto
+// the current settings. Safe to call before the window controls exist
+// (e.g. during early startup): every handle is checked individually rather
+// than gated on one "window ready" flag, since layout_main_window_controls
+// creates them one at a time and a partially constructed window must not
+// crash on refresh.
+void refresh_main_window(AppState& state) {
+    if (state.main_arm_button) {
+        SetWindowTextW(
+            state.main_arm_button,
+            state.armed ? L"Disarm bridge" : L"Arm bridge until manual disarm");
+    }
+    if (state.main_status_label) {
+        SetWindowTextW(state.main_status_label, tray_tooltip(state).c_str());
+    }
+    const auto check = [](HWND control, bool checked) {
+        if (control) {
+            SendMessageW(control, BM_SETCHECK,
+                checked ? BST_CHECKED : BST_UNCHECKED, 0);
+        }
+    };
+    const bool nvidia = state.settings.backend == xrfg::standalone::FlowBackend::nvidia;
+    check(state.main_backend_fidelity_fx, !nvidia);
+    check(state.main_backend_nvidia_fast, nvidia &&
+        state.settings.nvidia_preset == xrfg::standalone::NvidiaPerformancePreset::fast);
+    check(state.main_backend_nvidia_medium, nvidia &&
+        state.settings.nvidia_preset == xrfg::standalone::NvidiaPerformancePreset::medium);
+    check(state.main_backend_nvidia_slow, nvidia &&
+        state.settings.nvidia_preset == xrfg::standalone::NvidiaPerformancePreset::slow);
+    check(state.main_nvidia_bidirectional, state.settings.nvidia_bidirectional);
+    check(state.main_nvidia_scale_full,
+        state.settings.nvidia_input_scale == xrfg::standalone::NvidiaInputScale::full);
+    check(state.main_nvidia_scale_three_quarter,
+        state.settings.nvidia_input_scale == xrfg::standalone::NvidiaInputScale::three_quarter);
+    check(state.main_nvidia_scale_half,
+        state.settings.nvidia_input_scale == xrfg::standalone::NvidiaInputScale::half);
+    check(state.main_diagnostics, state.settings.diagnostics);
+    check(state.main_overlay_off, state.settings.overlay_position == xrfg::FpsOverlayPosition::off);
+    check(state.main_overlay_upper_left,
+        state.settings.overlay_position == xrfg::FpsOverlayPosition::upper_left);
+    check(state.main_overlay_upper_right,
+        state.settings.overlay_position == xrfg::FpsOverlayPosition::upper_right);
+    check(state.main_overlay_lower_left,
+        state.settings.overlay_position == xrfg::FpsOverlayPosition::lower_left);
+    check(state.main_overlay_lower_right,
+        state.settings.overlay_position == xrfg::FpsOverlayPosition::lower_right);
+    for (const HWND enabled_only_when_nvidia : {
+             state.main_nvidia_bidirectional,
+             state.main_nvidia_scale_full,
+             state.main_nvidia_scale_three_quarter,
+             state.main_nvidia_scale_half}) {
+        if (enabled_only_when_nvidia) {
+            EnableWindow(enabled_only_when_nvidia, nvidia);
+        }
+    }
+}
+
+// Builds the always-visible main window's child controls. Every control
+// posts the exact same MenuCommand IDs the tray context menu already uses,
+// through WM_COMMAND, so handle_command() stays the single place that owns
+// what a setting change does. The window itself has no independent
+// business logic.
+void layout_main_window_controls(AppState& state, HINSTANCE instance) {
+    constexpr int kMargin = 12;
+    constexpr int kLineHeight = 24;
+    constexpr int kGroupGap = 10;
+    constexpr int kWidth = 360;
+    int y = kMargin;
+
+    const auto make = [&](const wchar_t* class_name,
+                           const wchar_t* text,
+                           DWORD style,
+                           int x,
+                           int width,
+                           int height,
+                           int command_id) {
+        return CreateWindowExW(
+            0,
+            class_name,
+            text,
+            WS_CHILD | WS_VISIBLE | style,
+            x,
+            y,
+            width,
+            height,
+            state.window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(command_id)),
+            instance,
+            nullptr);
+    };
+
+    state.main_status_label = make(
+        L"STATIC", L"", WS_GROUP, kMargin, kWidth - 2 * kMargin, kLineHeight,
+        kStatusLabelControlId);
+    y += kLineHeight + 4;
+    state.main_arm_button = make(
+        L"BUTTON", L"Arm bridge until manual disarm",
+        BS_PUSHBUTTON, kMargin, kWidth - 2 * kMargin, 28, toggle_arm);
+    y += 28 + kGroupGap;
+
+    make(L"STATIC", L"Optical flow backend", 0, kMargin, kWidth - 2 * kMargin,
+        kLineHeight, -1);
+    y += kLineHeight;
+    state.main_backend_fidelity_fx = make(
+        L"BUTTON", L"FidelityFX", BS_AUTORADIOBUTTON | WS_GROUP, kMargin + 8,
+        kWidth - 2 * kMargin - 8, kLineHeight, backend_fidelity_fx);
+    y += kLineHeight;
+    state.main_backend_nvidia_fast = make(
+        L"BUTTON", L"NVIDIA Fast (test)", BS_AUTORADIOBUTTON, kMargin + 8,
+        kWidth - 2 * kMargin - 8, kLineHeight, backend_nvidia_fast);
+    y += kLineHeight;
+    state.main_backend_nvidia_medium = make(
+        L"BUTTON", L"NVIDIA Medium", BS_AUTORADIOBUTTON, kMargin + 8,
+        kWidth - 2 * kMargin - 8, kLineHeight, backend_nvidia_medium);
+    y += kLineHeight;
+    state.main_backend_nvidia_slow = make(
+        L"BUTTON", L"NVIDIA Slow (best quality)", BS_AUTORADIOBUTTON,
+        kMargin + 8, kWidth - 2 * kMargin - 8, kLineHeight,
+        backend_nvidia_slow);
+    y += kLineHeight + kGroupGap;
+
+    state.main_nvidia_bidirectional = make(
+        L"BUTTON", L"NVIDIA bidirectional consistency",
+        BS_AUTOCHECKBOX | WS_GROUP, kMargin, kWidth - 2 * kMargin, kLineHeight,
+        toggle_nvidia_bidirectional);
+    y += kLineHeight + kGroupGap;
+
+    make(L"STATIC", L"NVIDIA OFA resolution", 0, kMargin, kWidth - 2 * kMargin,
+        kLineHeight, -1);
+    y += kLineHeight;
+    state.main_nvidia_scale_full = make(
+        L"BUTTON", L"100% (full resolution)", BS_AUTORADIOBUTTON | WS_GROUP,
+        kMargin + 8, kWidth - 2 * kMargin - 8, kLineHeight,
+        nvidia_scale_full);
+    y += kLineHeight;
+    state.main_nvidia_scale_three_quarter = make(
+        L"BUTTON", L"75%", BS_AUTORADIOBUTTON, kMargin + 8,
+        kWidth - 2 * kMargin - 8, kLineHeight, nvidia_scale_three_quarter);
+    y += kLineHeight;
+    state.main_nvidia_scale_half = make(
+        L"BUTTON", L"50%", BS_AUTORADIOBUTTON, kMargin + 8,
+        kWidth - 2 * kMargin - 8, kLineHeight, nvidia_scale_half);
+    y += kLineHeight + kGroupGap;
+
+    state.main_diagnostics = make(
+        L"BUTTON", L"Bridge flight recorder", BS_AUTOCHECKBOX | WS_GROUP,
+        kMargin, kWidth - 2 * kMargin, kLineHeight, toggle_diagnostics);
+    y += kLineHeight + kGroupGap;
+
+    make(L"STATIC", L"FPS overlay", 0, kMargin, kWidth - 2 * kMargin,
+        kLineHeight, -1);
+    y += kLineHeight;
+    state.main_overlay_upper_left = make(
+        L"BUTTON", L"Upper left", BS_AUTORADIOBUTTON | WS_GROUP, kMargin + 8,
+        (kWidth - 2 * kMargin - 8) / 2, kLineHeight, overlay_upper_left);
+    state.main_overlay_upper_right = make(
+        L"BUTTON", L"Upper right", BS_AUTORADIOBUTTON,
+        kMargin + 8 + (kWidth - 2 * kMargin - 8) / 2,
+        (kWidth - 2 * kMargin - 8) / 2, kLineHeight, overlay_upper_right);
+    y += kLineHeight;
+    state.main_overlay_lower_left = make(
+        L"BUTTON", L"Lower left", BS_AUTORADIOBUTTON, kMargin + 8,
+        (kWidth - 2 * kMargin - 8) / 2, kLineHeight, overlay_lower_left);
+    state.main_overlay_lower_right = make(
+        L"BUTTON", L"Lower right", BS_AUTORADIOBUTTON,
+        kMargin + 8 + (kWidth - 2 * kMargin - 8) / 2,
+        (kWidth - 2 * kMargin - 8) / 2, kLineHeight, overlay_lower_right);
+    y += kLineHeight;
+    state.main_overlay_off = make(
+        L"BUTTON", L"Off", BS_AUTORADIOBUTTON, kMargin + 8,
+        kWidth - 2 * kMargin - 8, kLineHeight, overlay_off);
+    y += kLineHeight + kGroupGap;
+
+    make(L"BUTTON", L"Open bridge logs", BS_PUSHBUTTON, kMargin,
+        (kWidth - 2 * kMargin - 8) / 2, 26, open_logs);
+    make(L"BUTTON", L"About", BS_PUSHBUTTON,
+        kMargin + (kWidth - 2 * kMargin - 8) / 2 + 8,
+        (kWidth - 2 * kMargin - 8) / 2, 26, show_about);
+    y += 26 + kMargin;
+
+    RECT client{0, 0, kWidth, y};
+    AdjustWindowRectEx(
+        &client,
+        static_cast<DWORD>(GetWindowLongPtrW(state.window, GWL_STYLE)),
+        FALSE,
+        static_cast<DWORD>(GetWindowLongPtrW(state.window, GWL_EXSTYLE)));
+    SetWindowPos(
+        state.window,
+        nullptr,
+        0,
+        0,
+        client.right - client.left,
+        client.bottom - client.top,
+        SWP_NOMOVE | SWP_NOZORDER);
+
+    const HFONT dialog_font = reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+    EnumChildWindows(
+        state.window,
+        [](HWND child, LPARAM font) -> BOOL {
+            SendMessageW(child, WM_SETFONT,
+                reinterpret_cast<WPARAM>(reinterpret_cast<HFONT>(font)), TRUE);
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(dialog_font));
+
+    refresh_main_window(state);
+}
+
 [[nodiscard]] bool disarm_bridge(
     AppState& state,
     std::wstring* error) {
@@ -437,6 +674,7 @@ void show_balloon(
     state.armed_manifest.clear();
     state.armed_scope = xrfg::implicit_layer::RegistryScope::current_user;
     refresh_tray_icon(state);
+    refresh_main_window(state);
     return true;
 }
 
@@ -481,6 +719,7 @@ void show_balloon(
             ? L"arm-hklm"
             : L"arm-hkcu");
     refresh_tray_icon(state);
+    refresh_main_window(state);
     show_balloon(
         state,
         L"OFXR Bridge armed",
@@ -497,6 +736,7 @@ void update_runtime_options(AppState& state, bool overlay_change = false) {
         }
     }
     refresh_tray_icon(state);
+    refresh_main_window(state);
     if (state.armed) {
         show_balloon(
             state,
@@ -992,16 +1232,28 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     window_class.lpszClassName = kWindowClass;
     window_class.hIconSm = state.disarmed_icon;
+    // Only matters now that the window is actually shown; it was always
+    // hidden before this change, so an unpainted background never showed.
+    window_class.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
     if (RegisterClassExW(&window_class) == 0) {
         CloseHandle(single_instance);
         return EXIT_FAILURE;
     }
 
+    // A fixed-size dialog-style frame: the child control layout below is not
+    // designed to reflow, so WS_THICKFRAME (resizing) is deliberately left
+    // out. The window is shown at startup (unlike the tray-only original,
+    // which kept it hidden as a pure message sink) so every setting the
+    // context menu exposes is also reachable without a right-click. The
+    // tray icon and its menu remain fully functional side by side; closing
+    // this window still exits the application exactly as before (WM_CLOSE
+    // is unchanged), matching a normal desktop app rather than "minimize to
+    // tray" behavior.
     const HWND window = CreateWindowExW(
         0,
         kWindowClass,
         kApplicationName,
-        WS_OVERLAPPED,
+        (WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX) | WS_VISIBLE,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
@@ -1015,9 +1267,20 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         CloseHandle(single_instance);
         return EXIT_FAILURE;
     }
+    layout_main_window_controls(state, instance);
+    ShowWindow(window, SW_SHOWNORMAL);
+    UpdateWindow(window);
 
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+        // Lets Tab/arrow-key navigation and Enter/Space activation work
+        // across the main window's child buttons, the same way a dialog box
+        // handles them; window_procedure is an ordinary WNDPROC, not a
+        // dialog procedure, so this would otherwise require reimplementing
+        // that keyboard handling by hand.
+        if (IsDialogMessageW(window, &message)) {
+            continue;
+        }
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }

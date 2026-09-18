@@ -45,7 +45,31 @@ void dred_marker(ID3D12GraphicsCommandList* command_list, const char* label) noe
     }
 }
 
+// The number of GPU work slots was previously tied one-to-one to the
+// history ring size (D3D12SwapchainHistory::kSlotCount, currently 3),
+// purely as an initial simplification: acquire_work_slot() already round-
+// robins over work_slots.size() generically and tolerates any size,
+// returning ERROR_BUSY (not a deadlock or corruption) when every slot is
+// still fenced. The history ring itself has a real A/B/S pipelining
+// contract and is untouched here.
+//
+// For the NVIDIA backend specifically, each slot also owns a full private
+// set of per-eye Optical Flow input/flow/cost textures at (near) full
+// resolution (see create_nvidia_resources), so this count multiplies
+// directly into resident VRAM: on a high-resolution headset the NVIDIA
+// working set alone can approach several hundred MB. Decoupling the two
+// lets the NVIDIA path use fewer slots without touching the history ring's
+// own sizing. FidelityFX resources are comparatively small (subsampled
+// flow/cost, no dedicated NVIDIA input copies) and keep using the same
+// count as history, matching prior behavior exactly.
+//
+// This trades some synthesis pipelining depth for materially lower NVIDIA
+// VRAM use (see the "Not enough video memory" reports on high-resolution
+// headsets). It has not been validated on real NVIDIA hardware in a live
+// VR session; if ERROR_BUSY-driven stalls or reduced smoothness show up in
+// testing, raise kNvidiaWorkSlotCount back toward kWorkSlotCount.
 constexpr std::uint32_t kWorkSlotCount = D3D12SwapchainHistory::kSlotCount;
+constexpr std::uint32_t kNvidiaWorkSlotCount = 2;
 constexpr UINT kFidelityFxFlowBlockSize = 8;
 constexpr UINT kNvidiaFlowBlockSize = 4;
 constexpr UINT kEyeGapPixels = 64;
@@ -1326,6 +1350,8 @@ struct D3D12FrameSynthesizer::Impl {
         // doubled again when the bidirectional preset also allocates
         // backward flow/cost. This mirrors the allocation loop below and is
         // only used to report an estimate; it does not gate initialization.
+        // Only kNvidiaWorkSlotCount slots actually get an OFA surface set
+        // (see its definition), not the full work_slots.size().
         {
             const UINT64 per_eye_bytes =
                 2U * estimated_resource_size(device.Get(), input_description) +
@@ -1334,7 +1360,9 @@ struct D3D12FrameSynthesizer::Impl {
                      estimated_resource_size(device.Get(), cost_description));
             const UINT64 estimated_bytes = per_eye_bytes *
                 static_cast<UINT64>(image_description.DepthOrArraySize) *
-                static_cast<UINT64>(work_slots.size());
+                static_cast<UINT64>(std::min(
+                    kNvidiaWorkSlotCount,
+                    static_cast<std::uint32_t>(work_slots.size())));
             report_vram_budget_if_enabled(device.Get(), estimated_bytes);
         }
 
@@ -1414,7 +1442,14 @@ struct D3D12FrameSynthesizer::Impl {
             // previous slot is still executing without overwriting registered
             // input, flow or cost resources.  The per-eye contexts remain
             // independent and fence points preserve submission order.
-            for (WorkSlot& slot : work_slots) {
+            //
+            // Only the first kNvidiaWorkSlotCount slots get an OFA surface
+            // set (see its definition for why). record_nvidia_pair() is
+            // only ever invoked for a slot acquired through
+            // acquire_work_slot(), which is bounded to that same count for
+            // the NVIDIA backend, so an unallocated slot's NvidiaEyeResources
+            // (all null ComPtr/handle members) is never dereferenced.
+            for (WorkSlot& slot : std::span(work_slots).first(kNvidiaWorkSlotCount)) {
                 NvidiaEyeResources& eye = slot.nvidia_eyes[eye_index];
                 const std::array<std::pair<const D3D12_RESOURCE_DESC*,
                                            ComPtr<ID3D12Resource>*>, 4>
@@ -1653,6 +1688,15 @@ struct D3D12FrameSynthesizer::Impl {
             uav_description.Texture2D.MipSlice = 0;
             uav_description.Texture2D.PlaneSlice = 0;
             if (backend == D3D12OpticalFlowBackend::nvidia) {
+                // Slots beyond kNvidiaWorkSlotCount never had their
+                // NvidiaEyeResources populated (create_nvidia_resources
+                // only allocates that many), so `eye` here is all null
+                // ComPtr members for them. D3D12 null descriptors (a real
+                // view description bound to a null resource) are an
+                // explicitly supported way to create an unused/inert slot
+                // in the descriptor heap, so this remains safe -- it just
+                // wires up descriptors that acquire_work_slot() will never
+                // hand out on the NVIDIA backend.
                 for (UINT eye_index = 0;
                      eye_index < image_description.DepthOrArraySize;
                      ++eye_index) {
@@ -2306,10 +2350,26 @@ struct D3D12FrameSynthesizer::Impl {
         if (output_index == nullptr) {
             return E_POINTER;
         }
-        for (std::uint32_t offset = 0; offset < work_slots.size(); ++offset) {
-            const std::uint32_t index =
-                (next_work_slot + offset) %
-                static_cast<std::uint32_t>(work_slots.size());
+        // NVIDIA only allocated an OFA surface set (NvidiaEyeResources) for
+        // the first kNvidiaWorkSlotCount slots in create_nvidia_resources;
+        // acquiring a slot beyond that on this backend would hand out a
+        // slot whose eye resources were never created. FidelityFX has no
+        // such restriction and keeps the full ring.
+        //
+        // next_work_slot is advanced modulo the full work_slots.size() by
+        // every caller (it is shared with the FidelityFX path and reused
+        // across backend reconfigurations), so on NVIDIA it can carry a
+        // value at or beyond slot_limit; re-reducing it here with
+        // "% slot_limit" keeps the scan's starting point valid without
+        // requiring every writer to know the active backend's limit.
+        const std::uint32_t slot_limit =
+            backend == D3D12OpticalFlowBackend::nvidia
+                ? std::min(
+                      kNvidiaWorkSlotCount,
+                      static_cast<std::uint32_t>(work_slots.size()))
+                : static_cast<std::uint32_t>(work_slots.size());
+        for (std::uint32_t offset = 0; offset < slot_limit; ++offset) {
+            const std::uint32_t index = (next_work_slot + offset) % slot_limit;
             const HRESULT status =
                 fence_status(fence.Get(), work_slots[index].fence_value);
             if (status == S_OK) {

@@ -1,9 +1,11 @@
 #include "xrfg/game_profiles.hpp"
 
 #include <windows.h>
+#include <tlhelp32.h>
 
 #include <algorithm>
 #include <cctype>
+#include <cwctype>
 #include <sstream>
 #include <stdexcept>
 
@@ -227,6 +229,13 @@ using xrfg::standalone::NvidiaPerformancePreset;
             (object.find("true", bidirectional_key) <
              object.find_first_of(",}", bidirectional_key));
     }
+    const std::size_t auto_detect_key = object.find("\"auto_detect\"");
+    if (auto_detect_key != std::string_view::npos) {
+        const std::size_t field_end = object.find_first_of(",}", auto_detect_key);
+        const std::size_t true_position = object.find("true", auto_detect_key);
+        profile.auto_detect =
+            true_position != std::string_view::npos && true_position < field_end;
+    }
     return profile;
 }
 
@@ -296,7 +305,8 @@ std::string serialize_store(const GameProfileStore& store) {
                << ",\n"
                << "    "
                << field("nvidia_bidirectional", profile.settings.nvidia_bidirectional)
-               << "\n"
+               << ",\n"
+               << "    " << field("auto_detect", profile.auto_detect) << "\n"
                << "  }" << (i + 1 < store.profiles.size() ? "," : "") << "\n";
     }
     output << "]\n";
@@ -313,6 +323,44 @@ std::string to_utf8(std::wstring_view value) {
 
 std::wstring to_wide(std::string_view value) {
     return utf8_to_wide(value);
+}
+
+std::vector<std::wstring> running_executable_names() {
+    std::vector<std::wstring> names;
+    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return names;
+    }
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    if (Process32FirstW(snapshot, &entry)) {
+        do {
+            names.emplace_back(entry.szExeFile);
+        } while (Process32NextW(snapshot, &entry));
+    }
+    CloseHandle(snapshot);
+    return names;
+}
+
+bool game_process_running(
+    const GameProfile& profile,
+    const std::vector<std::wstring>& running_names) {
+    const std::wstring target = profile.game_executable.filename().wstring();
+    if (target.empty()) {
+        return false;
+    }
+    const auto to_lower = [](std::wstring value) {
+        std::transform(value.begin(), value.end(), value.begin(), [](wchar_t c) {
+            return static_cast<wchar_t>(std::towlower(c));
+        });
+        return value;
+    };
+    const std::wstring target_lower = to_lower(target);
+    return std::any_of(
+        running_names.begin(), running_names.end(),
+        [&](const std::wstring& running_name) {
+            return to_lower(running_name) == target_lower;
+        });
 }
 
 std::wstring build_launch_command(const GameProfile& profile) {

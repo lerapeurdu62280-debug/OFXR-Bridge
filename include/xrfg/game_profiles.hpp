@@ -30,6 +30,11 @@ struct GameProfile {
     std::string mod_arguments;
     // Bridge settings applied automatically before arming for this game.
     xrfg::standalone::LauncherSettings settings;
+    // When set, the tray watches for game_executable's process name and
+    // launches the mod + arms the bridge as soon as it appears, without
+    // requiring a menu click. Off by default: a newly added profile should
+    // not silently start behaving differently from a manual launch.
+    bool auto_detect{};
 };
 
 struct GameProfileStore {
@@ -60,5 +65,21 @@ struct GameProfileStore {
 // The inverse of to_utf8, e.g. for displaying a stored profile name (UTF-8)
 // in a Win32 wide-character menu.
 [[nodiscard]] std::wstring to_wide(std::string_view value);
+
+// Snapshots the currently running processes' executable file names (e.g.
+// "ForzaHorizon6.exe", case preserved as reported by Windows). Returns an
+// empty list on failure (e.g. the snapshot API is unavailable) rather than
+// throwing -- a detection poll that finds nothing this tick is expected
+// behavior, not an error.
+[[nodiscard]] std::vector<std::wstring> running_executable_names();
+
+// True when `profile.game_executable`'s file name matches one of
+// `running_names`, case-insensitively (Windows process names are not
+// case-sensitive). An empty game_executable never matches, so a profile
+// added without a game path is inert for detection rather than matching
+// everything.
+[[nodiscard]] bool game_process_running(
+    const GameProfile& profile,
+    const std::vector<std::wstring>& running_names);
 
 } // namespace xrfg::game_profiles

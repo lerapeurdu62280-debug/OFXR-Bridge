@@ -34,6 +34,8 @@ constexpr wchar_t kCleanupArgument[] = L"--cleanup-manual-arm";
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT_PTR kTrayId = 1;
 constexpr UINT kArmPollMilliseconds = 250;
+constexpr UINT_PTR kGameDetectionTimerId = 1;
+constexpr UINT kGameDetectionPollMilliseconds = 3000;
 constexpr std::uint32_t kImplementationVersion = XRFG_IMPLEMENTATION_VERSION;
 constexpr wchar_t kDonateUrl[] = L"https://ko-fi.com/tig3rmast3r";
 
@@ -75,6 +77,12 @@ struct AppState {
     std::filesystem::path settings_path;
     std::filesystem::path game_profiles_path;
     xrfg::game_profiles::GameProfileStore game_profiles;
+    // Name of the auto-detect profile currently believed to be running (its
+    // mod launched and the bridge armed for it), or empty when none is
+    // active. Only one auto-launch is tracked at a time -- concurrent VR
+    // games are not a scenario this targets -- so a detected game process
+    // is not relaunched every poll, and closing it triggers disarm.
+    std::string auto_detected_profile_name;
     std::filesystem::path armed_manifest;
     xrfg::implicit_layer::RegistryScope armed_scope{
         xrfg::implicit_layer::RegistryScope::current_user};
@@ -242,6 +250,14 @@ void save_game_profiles(const AppState& state) {
         ? "Game"
         : xrfg::game_profiles::to_utf8(profile.game_executable.stem().wstring());
     profile.settings = state.settings;
+    profile.auto_detect = MessageBoxW(
+        state.window,
+        L"Automatically launch the mod and arm the bridge whenever this "
+        L"game's process is detected running, instead of only from this "
+        L"menu?\r\n\r\nYou can change this later by editing the profiles "
+        L"file (\"Open profiles file\").",
+        L"Auto-detect this game?",
+        MB_YESNO | MB_ICONQUESTION) == IDYES;
     state.game_profiles.profiles.push_back(profile);
     save_game_profiles(state);
     static_cast<void>(error);
@@ -624,6 +640,55 @@ void update_runtime_options(AppState& state, bool overlay_change = false) {
     }
 }
 
+// Polled every kGameDetectionPollMilliseconds via WM_TIMER. Starts the mod
+// and arms the bridge for the first auto_detect profile whose game process
+// just appeared, and disarms when the previously detected game's process
+// disappears. Never touches a profile the user launched by hand from the
+// menu -- auto_detected_profile_name only ever holds a name this function
+// itself set.
+void poll_game_detection(AppState& state) {
+    const auto running = xrfg::game_profiles::running_executable_names();
+
+    if (!state.auto_detected_profile_name.empty()) {
+        const auto active = std::find_if(
+            state.game_profiles.profiles.begin(),
+            state.game_profiles.profiles.end(),
+            [&](const xrfg::game_profiles::GameProfile& profile) {
+                return profile.name == state.auto_detected_profile_name;
+            });
+        const bool still_running = active !=
+            state.game_profiles.profiles.end() &&
+            xrfg::game_profiles::game_process_running(*active, running);
+        if (!still_running) {
+            std::wstring error;
+            if (state.armed && !disarm_bridge(state, &error)) {
+                log_lifecycle(state.local_directory, L"auto-detect-disarm", error);
+            }
+            state.auto_detected_profile_name.clear();
+        }
+        return; // One tracked game at a time; wait for it to close first.
+    }
+
+    for (const auto& profile : state.game_profiles.profiles) {
+        if (!profile.auto_detect) {
+            continue;
+        }
+        if (!xrfg::game_profiles::game_process_running(profile, running)) {
+            continue;
+        }
+        std::wstring error;
+        if (!launch_game_profile(state, profile, &error)) {
+            log_lifecycle(state.local_directory, L"auto-detect-launch", error);
+            continue; // Try again on the next poll rather than looping now.
+        }
+        if (!arm_bridge(state, &error)) {
+            log_lifecycle(state.local_directory, L"auto-detect-arm", error);
+        }
+        state.auto_detected_profile_name = profile.name;
+        break; // Only one auto-launch tracked at a time.
+    }
+}
+
 void show_context_menu(AppState& state) {
     HMENU menu = CreatePopupMenu();
     HMENU backend_menu = CreatePopupMenu();
@@ -756,9 +821,12 @@ void show_context_menu(AppState& state) {
             if (command_id > game_profile_launch_max) {
                 break; // Reserved range exhausted; extra profiles are unreachable from here.
             }
-            const std::wstring label = profile.name.empty()
+            std::wstring label = profile.name.empty()
                 ? L"(unnamed game)"
                 : xrfg::game_profiles::to_wide(profile.name);
+            if (profile.auto_detect) {
+                label += L" (auto-detect)";
+            }
             AppendMenuW(games_menu, MF_STRING, command_id, label.c_str());
             ++command_id;
         }
@@ -986,6 +1054,11 @@ LRESULT CALLBACK window_procedure(
     case WM_COMMAND:
         handle_command(*state, LOWORD(wparam));
         return 0;
+    case WM_TIMER:
+        if (wparam == kGameDetectionTimerId) {
+            poll_game_detection(*state);
+        }
+        return 0;
     case WM_CLOSE: {
         std::wstring error;
         if (!disarm_bridge(*state, &error)) {
@@ -1189,12 +1262,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         CloseHandle(single_instance);
         return EXIT_FAILURE;
     }
+    SetTimer(window, kGameDetectionTimerId, kGameDetectionPollMilliseconds, nullptr);
 
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }
+    KillTimer(window, kGameDetectionTimerId);
     std::wstring cleanup_error;
     const bool clean_exit = disarm_bridge(state, &cleanup_error);
     if (!clean_exit) log_lifecycle(state.local_directory, L"message-loop-exit", cleanup_error);

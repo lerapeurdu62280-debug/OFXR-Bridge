@@ -1,7 +1,9 @@
 #include "xrfg/game_profiles.hpp"
 
+#include <algorithm>
 #include <iostream>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -122,6 +124,72 @@ int main() {
         L"game_profiles.json") {
         std::cerr << "store path failed\n";
         return 1;
+    }
+
+    // auto_detect defaults to false and round-trips through the store.
+    {
+        GameProfile profile;
+        profile.name = "Detected Game";
+        profile.mod_executable = L"C:\\Mods\\mod.exe";
+        if (profile.auto_detect) {
+            std::cerr << "auto_detect default should be false\n";
+            return 1;
+        }
+        profile.auto_detect = true;
+        GameProfileStore store;
+        store.profiles.push_back(profile);
+        const GameProfileStore parsed = parse_store(serialize_store(store));
+        if (parsed.profiles.size() != 1 || !parsed.profiles.front().auto_detect) {
+            std::cerr << "auto_detect round-trip failed\n";
+            return 1;
+        }
+        store.profiles.front().auto_detect = false;
+        const GameProfileStore parsed_off =
+            parse_store(serialize_store(store));
+        if (parsed_off.profiles.front().auto_detect) {
+            std::cerr << "auto_detect false round-trip failed\n";
+            return 1;
+        }
+    }
+
+    // Detection matches by executable file name only, case-insensitively,
+    // and never matches when the profile has no game path configured.
+    {
+        GameProfile profile;
+        profile.game_executable =
+            LR"(C:\XboxGames\Forza Horizon 6\Content\ForzaHorizon6.exe)";
+        const std::vector<std::wstring> running_mixed_case = {
+            L"explorer.exe", L"FORZAHORIZON6.EXE", L"steam.exe"};
+        if (!game_process_running(profile, running_mixed_case)) {
+            std::cerr << "case-insensitive process match failed\n";
+            return 1;
+        }
+        const std::vector<std::wstring> running_without_game = {
+            L"explorer.exe", L"steam.exe"};
+        if (game_process_running(profile, running_without_game)) {
+            std::cerr << "process match false positive\n";
+            return 1;
+        }
+        GameProfile no_path;
+        if (game_process_running(no_path, running_mixed_case)) {
+            std::cerr << "empty game path should never match\n";
+            return 1;
+        }
+    }
+
+    // running_executable_names() should at least see this test's own
+    // process (or degrade to an empty list, never throw).
+    {
+        const auto running = running_executable_names();
+        const bool sees_test_binary = std::any_of(
+            running.begin(), running.end(), [](const std::wstring& name) {
+                return name.find(L"xrfg_game_profiles_tests") !=
+                    std::wstring::npos;
+            });
+        if (!running.empty() && !sees_test_binary) {
+            std::cerr << "process snapshot did not include this process\n";
+            return 1;
+        }
     }
 
     std::cout << "OFXR game profile tests passed\n";

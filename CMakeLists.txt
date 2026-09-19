@@ -288,7 +288,9 @@ if(WIN32 AND XRFG_BUILD_LAYER)
     if(XRFG_BUILD_STANDALONE)
         add_library(xrfg_standalone_core STATIC
             src/tray/standalone_launcher.cpp
-            include/xrfg/standalone_launcher.hpp)
+            include/xrfg/standalone_launcher.hpp
+            src/tray/game_profiles.cpp
+            include/xrfg/game_profiles.hpp)
         target_include_directories(xrfg_standalone_core PUBLIC include)
         target_compile_features(xrfg_standalone_core PUBLIC cxx_std_20)
         target_link_libraries(xrfg_standalone_core PUBLIC xrfg_implicit_layer xrfg_core)
@@ -309,6 +311,7 @@ if(WIN32 AND XRFG_BUILD_LAYER)
         target_link_libraries(OFXRBridgeTray PRIVATE
             xrfg_standalone_core
             comctl32
+            comdlg32
             ole32
             shell32
             user32)
@@ -353,6 +356,23 @@ if(WIN32 AND XRFG_BUILD_LAYER)
             endif()
             add_test(NAME xrfg_standalone_launcher_tests
                 COMMAND xrfg_standalone_launcher_tests)
+            add_executable(xrfg_game_profiles_tests
+                tests/game_profiles_tests.cpp)
+            target_link_libraries(xrfg_game_profiles_tests PRIVATE
+                xrfg_standalone_core)
+            target_compile_features(xrfg_game_profiles_tests PRIVATE
+                cxx_std_20)
+            if(MSVC)
+                target_compile_options(xrfg_game_profiles_tests PRIVATE
+                    /W4 /permissive- /EHsc)
+                target_compile_definitions(xrfg_game_profiles_tests PRIVATE
+                    NOMINMAX
+                    WIN32_LEAN_AND_MEAN
+                    UNICODE
+                    _UNICODE)
+            endif()
+            add_test(NAME xrfg_game_profiles_tests
+                COMMAND xrfg_game_profiles_tests)
             add_executable(xrfg_tray_lifecycle_tests tests/tray_lifecycle_tests.cpp)
             target_link_libraries(xrfg_tray_lifecycle_tests PRIVATE
                 xrfg_standalone_core comctl32 ole32 shell32 user32)

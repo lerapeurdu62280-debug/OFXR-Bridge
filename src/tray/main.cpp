@@ -1,9 +1,11 @@
+#include "xrfg/game_profiles.hpp"
 #include "xrfg/implicit_layer.hpp"
 #include "xrfg/standalone_launcher.hpp"
 #include "resource.h"
 
 #include <windows.h>
 #include <commctrl.h>
+#include <commdlg.h>
 #include <shellapi.h>
 #include <shlobj.h>
 
@@ -55,6 +57,13 @@ enum MenuCommand : UINT {
     donate = 139,
     show_about = 140,
     exit_application = 150,
+    add_game_profile = 160,
+    manage_game_profiles = 161,
+    // Reserved range for one dynamic entry per stored game profile
+    // (game_profile_launch_base + index). Kept well clear of every other
+    // fixed command ID above and below.
+    game_profile_launch_base = 1000,
+    game_profile_launch_max = 1999,
 };
 
 struct AppState {
@@ -64,6 +73,8 @@ struct AppState {
     std::filesystem::path executable_directory;
     std::filesystem::path local_directory;
     std::filesystem::path settings_path;
+    std::filesystem::path game_profiles_path;
+    xrfg::game_profiles::GameProfileStore game_profiles;
     std::filesystem::path armed_manifest;
     xrfg::implicit_layer::RegistryScope armed_scope{
         xrfg::implicit_layer::RegistryScope::current_user};
@@ -173,6 +184,113 @@ void save_settings(const AppState& state) {
         state.settings_path,
         xrfg::standalone::serialize_settings(state.settings),
         &ignored));
+}
+
+void load_game_profiles(AppState& state) {
+    std::ifstream stream(state.game_profiles_path, std::ios::binary);
+    if (!stream) {
+        return;
+    }
+    std::ostringstream text;
+    text << stream.rdbuf();
+    state.game_profiles = xrfg::game_profiles::parse_store(text.str());
+}
+
+void save_game_profiles(const AppState& state) {
+    std::wstring ignored;
+    static_cast<void>(write_text_atomic(
+        state.game_profiles_path,
+        xrfg::game_profiles::serialize_store(state.game_profiles),
+        &ignored));
+}
+
+// Prompts for two file paths (the game and its external VR mod) with the
+// standard Open dialog, and appends a new profile if both are chosen and a
+// name is available. Returns false without any error dialog if the user
+// simply cancels.
+[[nodiscard]] bool prompt_new_game_profile(AppState& state, std::wstring* error) {
+    wchar_t game_path[MAX_PATH]{};
+    OPENFILENAMEW game_dialog{};
+    game_dialog.lStructSize = sizeof(game_dialog);
+    game_dialog.hwndOwner = state.window;
+    game_dialog.lpstrFilter = L"Executable\0*.exe\0All files\0*.*\0";
+    game_dialog.lpstrFile = game_path;
+    game_dialog.nMaxFile = static_cast<DWORD>(std::size(game_path));
+    game_dialog.lpstrTitle = L"Select the game executable";
+    game_dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+    if (!GetOpenFileNameW(&game_dialog)) {
+        return false;
+    }
+
+    wchar_t mod_path[MAX_PATH]{};
+    OPENFILENAMEW mod_dialog{};
+    mod_dialog.lStructSize = sizeof(mod_dialog);
+    mod_dialog.hwndOwner = state.window;
+    mod_dialog.lpstrFilter = L"Executable\0*.exe\0All files\0*.*\0";
+    mod_dialog.lpstrFile = mod_path;
+    mod_dialog.nMaxFile = static_cast<DWORD>(std::size(mod_path));
+    mod_dialog.lpstrTitle = L"Select the external VR mod/injector to launch";
+    mod_dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+    if (!GetOpenFileNameW(&mod_dialog)) {
+        return false;
+    }
+
+    xrfg::game_profiles::GameProfile profile;
+    profile.game_executable = game_path;
+    profile.mod_executable = mod_path;
+    profile.name = profile.game_executable.stem().wstring().empty()
+        ? "Game"
+        : xrfg::game_profiles::to_utf8(profile.game_executable.stem().wstring());
+    profile.settings = state.settings;
+    state.game_profiles.profiles.push_back(profile);
+    save_game_profiles(state);
+    static_cast<void>(error);
+    return true;
+}
+
+// Launches a profile's external mod, then applies and arms the bridge with
+// the settings saved for it. This never touches the game process itself --
+// it only starts the tool the user configured and waits for it to expose
+// its own OpenXR session, exactly as it would if launched by hand.
+[[nodiscard]] bool launch_game_profile(
+    AppState& state,
+    const xrfg::game_profiles::GameProfile& profile,
+    std::wstring* error) {
+    if (!std::filesystem::is_regular_file(profile.mod_executable)) {
+        if (error) {
+            *error = L"The configured mod executable is missing:\r\n" +
+                     profile.mod_executable.wstring();
+        }
+        return false;
+    }
+    std::wstring command = xrfg::game_profiles::build_launch_command(profile);
+    std::vector<wchar_t> mutable_command(command.begin(), command.end());
+    mutable_command.push_back(L'\0');
+
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    const bool started = CreateProcessW(
+        profile.mod_executable.c_str(),
+        mutable_command.data(),
+        nullptr,
+        nullptr,
+        FALSE,
+        0,
+        nullptr,
+        profile.mod_executable.parent_path().c_str(),
+        &startup,
+        &process);
+    if (!started) {
+        if (error) *error = last_error_message(L"Starting the external VR mod");
+        return false;
+    }
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+
+    state.settings = profile.settings;
+    save_settings(state);
+    return true;
 }
 
 void show_error(HWND owner, const std::wstring& error) {
@@ -631,6 +749,27 @@ void show_context_menu(AppState& state) {
     }
     AppendMenuW(menu, MF_STRING, open_logs, L"Open bridge logs");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    HMENU games_menu = CreatePopupMenu();
+    if (games_menu) {
+        UINT command_id = game_profile_launch_base;
+        for (const auto& profile : state.game_profiles.profiles) {
+            if (command_id > game_profile_launch_max) {
+                break; // Reserved range exhausted; extra profiles are unreachable from here.
+            }
+            const std::wstring label = profile.name.empty()
+                ? L"(unnamed game)"
+                : xrfg::game_profiles::to_wide(profile.name);
+            AppendMenuW(games_menu, MF_STRING, command_id, label.c_str());
+            ++command_id;
+        }
+        if (!state.game_profiles.profiles.empty()) {
+            AppendMenuW(games_menu, MF_SEPARATOR, 0, nullptr);
+        }
+        AppendMenuW(games_menu, MF_STRING, add_game_profile, L"Add game...");
+        AppendMenuW(games_menu, MF_STRING, manage_game_profiles, L"Open profiles file");
+        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(games_menu),
+            L"Games (launch VR mod)");
+    }
     AppendMenuW(menu, MF_STRING, donate, L"Donate");
     AppendMenuW(menu, MF_STRING, show_about, L"About");
     AppendMenuW(menu, MF_STRING, exit_application, L"Exit");
@@ -778,7 +917,39 @@ void handle_command(AppState& state, UINT command) {
     case exit_application:
         SendMessageW(state.window, WM_CLOSE, 0, 0);
         break;
+    case add_game_profile: {
+        std::wstring error;
+        if (!prompt_new_game_profile(state, &error)) {
+            if (!error.empty()) show_error(state.window, error);
+        }
+        break;
+    }
+    case manage_game_profiles: {
+        std::error_code ignored;
+        std::filesystem::create_directories(state.local_directory, ignored);
+        if (!std::filesystem::is_regular_file(state.game_profiles_path)) {
+            save_game_profiles(state);
+        }
+        ShellExecuteW(state.window, L"open", state.game_profiles_path.c_str(),
+            nullptr, nullptr, SW_SHOWNORMAL);
+        break;
+    }
     default:
+        if (command >= game_profile_launch_base &&
+            command <= game_profile_launch_max) {
+            const std::size_t index = command - game_profile_launch_base;
+            if (index < state.game_profiles.profiles.size()) {
+                const auto& profile = state.game_profiles.profiles[index];
+                std::wstring error;
+                if (!launch_game_profile(state, profile, &error)) {
+                    show_error(state.window, error);
+                    break;
+                }
+                if (!arm_bridge(state, &error)) {
+                    show_error(state.window, error);
+                }
+            }
+        }
         break;
     }
 }
@@ -952,6 +1123,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         state.executable_directory = executable_directory();
         state.local_directory = local_app_data() / L"OFXR Bridge";
         state.settings_path = state.local_directory / L"tray.ini";
+        state.game_profiles_path =
+            xrfg::game_profiles::store_path(state.local_directory);
         std::wstring cleanup_error;
         if (!cleanup_all_owned_registrations(state, &cleanup_error)) {
             log_lifecycle(state.local_directory, L"startup-cleanup", cleanup_error);
@@ -961,6 +1134,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         }
         log_lifecycle(state.local_directory, L"startup-cleanup");
         load_settings(state);
+        load_game_profiles(state);
     } catch (...) {
         MessageBoxW(
             nullptr,

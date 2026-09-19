@@ -3,6 +3,9 @@
 /out/
 /external/FidelityFX-SDK-v1.1.4/
 /RuntimeLayer/
+# Third-party VR mod binaries (e.g. VRMod) fetched locally for game
+# profiles: no published license, never redistribute via this repo.
+/ofxr/external-mods/
 
 CMakeCache.txt
 CMakeFiles/
